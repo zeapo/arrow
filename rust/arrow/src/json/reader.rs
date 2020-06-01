@@ -44,7 +44,6 @@
 
 use indexmap::map::IndexMap as HashMap;
 use indexmap::set::IndexSet as HashSet;
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -54,6 +53,7 @@ use crate::array::*;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use crate::record_batch::RecordBatch;
+use std::borrow::BorrowMut;
 
 /// Coerce data type during inference
 ///
@@ -157,9 +157,27 @@ fn generate_schema(spec: HashMap<String, HashSet<DataType>>) -> Result<Arc<Schem
 /// `max_read_records` controlling the maximum number of records to read.
 ///
 /// If `max_read_records` is not set, the whole file is read to infer its field types.
-fn infer_json_schema(file: File, max_read_records: Option<usize>) -> Result<Arc<Schema>> {
+pub fn infer_json_schema_from_seekable<R: Read + Seek>(
+    source: &mut R,
+    max_read_records: Option<usize>,
+) -> Result<Arc<Schema>> {
+    let mut reader = BufReader::new(source.borrow_mut());
+    let schema = infer_json_schema_from_reader(&mut reader, max_read_records);
+    // return the reader seek back to the start
+    source.seek(SeekFrom::Start(0))?;
+
+    schema
+}
+
+/// Infer the fields of a JSON file by reading the first n records of the buffer, with
+/// `max_read_records` controlling the maximum number of records to read.
+///
+/// If `max_read_records` is not set, the whole file is read to infer its field types.
+pub fn infer_json_schema_from_reader<R: Read>(
+    reader: &mut BufReader<R>,
+    max_read_records: Option<usize>,
+) -> Result<Arc<Schema>> {
     let mut values: HashMap<String, HashSet<DataType>> = HashMap::new();
-    let mut reader = BufReader::new(file.try_clone()?);
 
     let mut line = String::new();
     for _ in 0..max_read_records.unwrap_or(std::usize::MAX) {
@@ -302,12 +320,7 @@ fn infer_json_schema(file: File, max_read_records: Option<usize>) -> Result<Arc<
         };
     }
 
-    let schema = generate_schema(values)?;
-
-    // return the reader seek back to the start
-    reader.into_inner().seek(SeekFrom::Start(0))?;
-
-    Ok(schema)
+    generate_schema(values)
 }
 
 /// JSON file reader
@@ -448,35 +461,35 @@ impl<R: Read> Reader<R> {
                             let mut builder = ListBuilder::new(values_builder);
                             for row in rows {
                                 if let Some(value) = row.get(field.name()) {
-                                        // value can be an array or a scalar
-                                        let vals: Vec<Option<String>> = if let Value::String(v) = value {
-                                            vec![Some(v.to_string())]
-                                        } else if let Value::Array(n) = value {
-                                            n.iter().map(|v: &Value| {
-                                                if v.is_string() {
-                                                    Some(v.as_str().unwrap().to_string())
-                                                } else if v.is_array() || v.is_object() {
-                                                    // implicitly drop nested values
-                                                    // TODO support deep-nesting
-                                                    None
-                                                } else {
-                                                    Some(v.to_string())
-                                                }
-                                            }).collect()
-                                        } else if let Value::Null = value {
-                                            vec![None]
-                                        } else if !value.is_object() {
-                                            vec![Some(value.to_string())]
-                                        } else {
-                                            return Err(ArrowError::JsonError("Only scalars are currently supported in JSON arrays".to_string()))
-                                        };
-                                        for val in vals {
-                                           if let Some(v) = val {
-                                                builder.values().append_value(&v)?
+                                    // value can be an array or a scalar
+                                    let vals: Vec<Option<String>> = if let Value::String(v) = value {
+                                        vec![Some(v.to_string())]
+                                    } else if let Value::Array(n) = value {
+                                        n.iter().map(|v: &Value| {
+                                            if v.is_string() {
+                                                Some(v.as_str().unwrap().to_string())
+                                            } else if v.is_array() || v.is_object() {
+                                                // implicitly drop nested values
+                                                // TODO support deep-nesting
+                                                None
                                             } else {
-                                                builder.values().append_null()?
-                                            };
-                                        }
+                                                Some(v.to_string())
+                                            }
+                                        }).collect()
+                                    } else if let Value::Null = value {
+                                        vec![None]
+                                    } else if !value.is_object() {
+                                        vec![Some(value.to_string())]
+                                    } else {
+                                        return Err(ArrowError::JsonError("Only scalars are currently supported in JSON arrays".to_string()));
+                                    };
+                                    for val in vals {
+                                        if let Some(v) = val {
+                                            builder.values().append_value(&v)?
+                                        } else {
+                                            builder.values().append_null()?
+                                        };
+                                    }
                                 }
                                 builder.append(true)?
                             }
@@ -708,13 +721,15 @@ impl ReaderBuilder {
     }
 
     /// Create a new `Reader` from the `ReaderBuilder`
-    pub fn build<R: Read>(self, file: File) -> Result<Reader<File>> {
+    pub fn build<R: Read + Seek>(self, source: R) -> Result<Reader<R>> {
+        let mut buf_reader = BufReader::new(source);
+
         // check if schema should be inferred
         let schema = match self.schema {
             Some(schema) => schema,
-            None => infer_json_schema(file.try_clone()?, self.max_records)?,
+            None => infer_json_schema_from_seekable(&mut buf_reader, self.max_records)?,
         };
-        let buf_reader = BufReader::new(file);
+
         Ok(Reader::new(
             buf_reader,
             schema,
@@ -727,6 +742,8 @@ impl ReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::fs::File;
 
     #[test]
     fn test_json_basic() {
@@ -1037,62 +1054,73 @@ mod tests {
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
 
-        assert_eq!(4, batch.num_columns());
-        assert_eq!(4, batch.num_rows());
+        let mut file = File::open("test/data/mixed_arrays.json.gz").unwrap();
+        let mut reader = BufReader::new(GzDecoder::new(&file));
+        let schema = infer_json_schema_from_reader(&mut reader, None).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
 
-        let schema = batch.schema();
+        let reader = BufReader::new(GzDecoder::new(&file));
+        let mut reader = Reader::new(reader, schema, 64, None);
+        let batch_gz = reader.next().unwrap().unwrap();
 
-        let a = schema.column_with_name("a").unwrap();
-        assert_eq!(&DataType::Int64, a.1.data_type());
-        let b = schema.column_with_name("b").unwrap();
-        assert_eq!(
-            &DataType::List(Box::new(DataType::Float64)),
-            b.1.data_type()
-        );
-        let c = schema.column_with_name("c").unwrap();
-        assert_eq!(
-            &DataType::List(Box::new(DataType::Boolean)),
-            c.1.data_type()
-        );
-        let d = schema.column_with_name("d").unwrap();
-        assert_eq!(&DataType::List(Box::new(DataType::Utf8)), d.1.data_type());
+        for batch in vec![batch, batch_gz] {
+            assert_eq!(4, batch.num_columns());
+            assert_eq!(4, batch.num_rows());
 
-        let bb = batch
-            .column(b.0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        let bb = bb.values();
-        let bb = bb.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert_eq!(10, bb.len());
-        assert_eq!(4.0, bb.value(9));
+            let schema = batch.schema();
 
-        let cc = batch
-            .column(c.0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        let cc = cc.values();
-        let cc = cc.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(6, cc.len());
-        assert_eq!(false, cc.value(0));
-        assert_eq!(false, cc.value(3));
-        assert_eq!(false, cc.is_valid(2));
-        assert_eq!(false, cc.is_valid(4));
+            let a = schema.column_with_name("a").unwrap();
+            assert_eq!(&DataType::Int64, a.1.data_type());
+            let b = schema.column_with_name("b").unwrap();
+            assert_eq!(
+                &DataType::List(Box::new(DataType::Float64)),
+                b.1.data_type()
+            );
+            let c = schema.column_with_name("c").unwrap();
+            assert_eq!(
+                &DataType::List(Box::new(DataType::Boolean)),
+                c.1.data_type()
+            );
+            let d = schema.column_with_name("d").unwrap();
+            assert_eq!(&DataType::List(Box::new(DataType::Utf8)), d.1.data_type());
 
-        let dd = batch
-            .column(d.0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        let dd = dd.values();
-        let dd = dd.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(7, dd.len());
-        assert_eq!(false, dd.is_valid(1));
-        assert_eq!("text", dd.value(2));
-        assert_eq!("1", dd.value(3));
-        assert_eq!("false", dd.value(4));
-        assert_eq!("array", dd.value(5));
-        assert_eq!("2.4", dd.value(6));
+            let bb = batch
+                .column(b.0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let bb = bb.values();
+            let bb = bb.as_any().downcast_ref::<Float64Array>().unwrap();
+            assert_eq!(10, bb.len());
+            assert_eq!(4.0, bb.value(9));
+
+            let cc = batch
+                .column(c.0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let cc = cc.values();
+            let cc = cc.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(6, cc.len());
+            assert_eq!(false, cc.value(0));
+            assert_eq!(false, cc.value(3));
+            assert_eq!(false, cc.is_valid(2));
+            assert_eq!(false, cc.is_valid(4));
+
+            let dd = batch
+                .column(d.0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let dd = dd.values();
+            let dd = dd.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(7, dd.len());
+            assert_eq!(false, dd.is_valid(1));
+            assert_eq!("text", dd.value(2));
+            assert_eq!("1", dd.value(3));
+            assert_eq!("false", dd.value(4));
+            assert_eq!("array", dd.value(5));
+            assert_eq!("2.4", dd.value(6));
+        }
     }
 }
